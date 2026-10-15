@@ -1,0 +1,12 @@
+.env
+.venv/
+.vscode/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.runtime/
+.memory/
+.tasks/
+.teams/
+.mailboxes/
+.worktrees/
