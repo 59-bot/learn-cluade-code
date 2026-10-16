@@ -1,5 +1,6 @@
 """s01 练习：在这里亲手实现最小 Agent Loop。"""
 """s02 加入其他工具 """
+"""s03 执行前做权限判断"""
 import os 
 from pathlib import Path
 import subprocess
@@ -117,6 +118,64 @@ TOOL_HANDLERS = {
     "edit_file": run_edit, "glob": run_glob,
 }
 
+# -- New in s03: three-gate permission pipeline --
+# Gate 1: Hard deny list - always forbidden
+
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+
+def check_deny_list(command: str) -> str | None:
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"Blocked: '{pattern}' is on the deny list"
+    return None
+
+# Gate 2: Rule matching - context-dependent checks
+import re
+DESTRUCTIVE_COMMAND_WORD = re.compile(
+    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
+)
+
+def contains_destructive_command(command: str) -> bool:
+    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
+
+PERMISSION_RULES = [
+    {
+        "tools": ["read_file","write_file","edit_file"],
+        "check": lamba args: not (WORKDIR / args.get("path","")).resolve().is_relative_to(WORKDIR),
+        "message": "Access outside workspace",
+    },
+    {
+        "tools": ["bash"],
+        "check": lamba args : contains_destructive_command(args.get("command", "")) or any(
+            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
+        ),
+        "message": "Potentially destructive command",
+    }
+]
+
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n⚠  {reason}")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+def check_permission(block) -> bool:
+    # 闸门 1: 硬拒绝
+    if block.name == "bash":
+        reason = check_deny_list(block.input.get("command", ""))
+        if reason:
+            print(f"\n⛔ {reason}")
+            return False
+
+    # 闸门 2 + 3: 规则匹配 → 用户审批
+    reason = check_rules(block.name, block.input)
+    if reason:
+        decision = ask_user(block.name, block.input, reason)
+        if decision == "deny":
+            return False
+
+    return True
+
 def agent_loop(messages: list):
     while True:
         response = client.messages.create(
@@ -140,6 +199,11 @@ def agent_loop(messages: list):
 
         for block in tool_calls:
             print(f"\033[33m$ {block.name}\033[0m")
+            if not check_permission(block):
+                results.append({"type": "tool_result", "tool_use_id": block.id,"content": "Permission denied."})
+                continue
+
+            
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
             print(str(output[:200]))
