@@ -1,6 +1,11 @@
+"""cd /mnt/d/software/study/code/learn-claude-code-handmade
+    source /home/administrator/.venvs/learn-claude-code-handmade/bin/activate
+    python s01_agent_loop/code.py
+"""
 """s01 练习：在这里亲手实现最小 Agent Loop。"""
 """s02 加入其他工具 """
 """s03 执行前做权限判断"""
+"""s04 Hooks — 挂在循环上，不写进循环里"""
 import os 
 from pathlib import Path
 import subprocess
@@ -42,7 +47,12 @@ TOOLS=[
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
 
-
+HOOKS={
+    "UserPromptSubmit": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
 
 # -- Tool execution --
 def save_path(p:str)->Path:
@@ -123,58 +133,92 @@ TOOL_HANDLERS = {
 
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
-    return None
 
 # Gate 2: Rule matching - context-dependent checks
 import re
 DESTRUCTIVE_COMMAND_WORD = re.compile(
     r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
 )
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 def contains_destructive_command(command: str) -> bool:
     return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
-PERMISSION_RULES = [
-    {
-        "tools": ["read_file","write_file","edit_file"],
-        "check": lamba args: not (WORKDIR / args.get("path","")).resolve().is_relative_to(WORKDIR),
-        "message": "Access outside workspace",
-    },
-    {
-        "tools": ["bash"],
-        "check": lamba args : contains_destructive_command(args.get("command", "")) or any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    }
-]
 
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
 
-def check_permission(block) -> bool:
+
+# -- Hooks execution --
+
+def permission_hook(block) :
     # 闸门 1: 硬拒绝
     if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n⛔ {reason}")
-            return False
+        command = block.input.get("command","")
+        for pattern in DENY_LIST:
+            if pattern in command:
+                print(f"\n\033[31m[blocked] '{pattern}'\033[0m")
+                return  "Permission denied by deny list"
+        if contains_destructive_command(command) or any(
+            kw in command for kw in DESTRUCTIVE
+        ):
+            print(f"\n\033[33m[permission] Potentially destructive command\033[0m")
+            print(f"   Tool: {block.name}({block.input})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"        
 
     # 闸门 2 + 3: 规则匹配 → 用户审批
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
+    if block.name in ("read_file","write_file","edit_file"):
+        path = block.input.get("path","")
+        if not (WORKDIR/ path).resolve().is_relative_to(WORKDIR):
+            print(f"\n\033[33m[permission] Access outside workspace\033[0m")
+            print(f"   Tool: {block.name}({block.input})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
 
-    return True
+
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+def context_inject_hook(query: str) -> str|None:
+    """Inject current working directory info into every prompt."""
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+
+register_hook("UserPromptSubmit", context_inject_hook)
+
+# PreToolUse: 日志
+def log_hook(block):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(block.input.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+
+# PostToolUse: 大文件提醒
+def large_output_hook(block, output):
+    if len(str(output)) > 100000:
+        print(f"[HOOK] ⚠ Large output from {block.name}")
+
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
+
+def summary_hook(messages: list) -> str | None:
+    """Print a summary when the loop is about to stop."""
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None   # return None = allow stop, return string = force continuation
+
+register_hook("Stop", summary_hook)
+
 
 def agent_loop(messages: list):
     while True:
@@ -193,20 +237,23 @@ def agent_loop(messages: list):
             block for block in response.content if block.type == "tool_use"
         ]
         if not tool_calls:
+            force = trigger_hooks("Stop", messages)   # ← 退出之前
+            if force :
+                messages.append({"role":"user","content":force})
             return
         
         results = []
 
         for block in tool_calls:
             print(f"\033[33m$ {block.name}\033[0m")
-            if not check_permission(block):
-                results.append({"type": "tool_result", "tool_use_id": block.id,"content": "Permission denied."})
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked :
+                results.append({"type":"tool_result","tool_use_id": block.id,"content": str(blocked)})
                 continue
-
             
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
-            print(str(output[:200]))
+            trigger_hooks("PostToolUse", block, output)
             results.append({
                 "type":"tool_result",
                 "tool_use_id": block.id,
@@ -222,7 +269,7 @@ if __name__ == "__main__":
 
     while True:
         try:
-            query = input("s01 >>")
+            query = input("s04 >>")
         except(EOFError, KeyboardInterrupt):
             break
         
